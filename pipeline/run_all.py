@@ -42,5 +42,6 @@ if __name__ == "__main__":
     run_stage("pipeline/ingest.py")
     run_stage("pipeline/transform.py")
     run_stage("pipeline/provision.py")
+    run_stage("pipeline/stream_ingest.py")
 
     print("Full pipeline completed successfully.")
