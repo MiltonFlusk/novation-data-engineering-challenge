@@ -164,7 +164,7 @@ See `resource_constraints.md` for practical guidance on working within these lim
 
 ## Final Pipeline Output
 
-The pipeline provisions a medallion-style data architecture with Bronze, Silver and Gold layers.
+The pipeline provisions a medallion-style data architecture with Bronze, Silver, Gold, and Stage 3 streaming outputs.
 
 ### Output Structure
 
@@ -176,4 +176,8 @@ data/output/
 │   ├── dim_accounts/
 │   ├── dim_customers/
 │   └── fact_transactions/
+├── stream_gold/
+│   ├── current_balances/
+│   └── recent_transactions/
 └── dq_report.json
+
