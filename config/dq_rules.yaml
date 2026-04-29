@@ -1,0 +1,50 @@
+null_checks:
+  transactions:
+    - transaction_id
+    - account_id
+    - transaction_date
+    - amount
+    - transaction_type
+    - currency
+
+type_checks:
+  transactions:
+    amount: decimal
+    transaction_date: date
+
+domain_checks:
+  transaction_type:
+    allowed:
+      - DEBIT
+      - CREDIT
+      - FEE
+      - REVERSAL
+    dq_flag: TYPE_MISMATCH
+
+currency_normalisation:
+  target_value: ZAR
+  accepted_values:
+    - ZAR
+    - RAND
+    - R
+    - ZA RAND
+  dq_flag: CURRENCY_VARIANT
+
+date_format_checks:
+  transactions:
+    - transaction_date
+
+referential_integrity:
+  transactions:
+    - field: account_id
+      references_table: accounts
+      references_field: account_id
+      dq_flag: ORPHANED_ACCOUNT
+
+valid_dq_flags:
+  - ORPHANED_ACCOUNT
+  - DUPLICATE_DEDUPED
+  - TYPE_MISMATCH
+  - DATE_FORMAT
+  - CURRENCY_VARIANT
+  - NULL_REQUIRED

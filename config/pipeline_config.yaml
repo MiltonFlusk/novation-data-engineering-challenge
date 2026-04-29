@@ -1,0 +1,17 @@
+input:
+  accounts_path: data/input/accounts.csv
+  transactions_path: data/input/transactions.jsonl
+  customers_path: data/input/customers.csv
+
+output:
+  bronze_path: data/output/bronze
+  silver_path: data/output/silver
+  gold_path: data/output/gold
+  dq_report_path: data/output/dq_report.json
+
+spark:
+  master: local[2]
+  app_name: nedbank-de-pipeline
+
+dq:
+  rules_path: config/dq_rules.yaml
