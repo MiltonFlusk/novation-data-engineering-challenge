@@ -141,54 +141,49 @@ def standardise_transactions(df):
 # ==================================================
 
 def apply_dq_rules(df, dq_rules, accounts_df):
-    df = df.withColumn("dq_flag", lit(None))
+    df = df.withColumn("dq_flag", lit(None).cast("string"))
 
-    # NULL checks
-    for field in dq_rules.get("null_checks", {}).get("transactions", []):
-        df = df.withColumn(
-            "dq_flag",
-            when(col(field).isNull(), "NULL_REQUIRED").otherwise(col("dq_flag"))
-        )
+    required_fields = [
+        "transaction_id",
+        "account_id",
+        "transaction_date",
+        "transaction_time",
+        "transaction_type",
+        "amount",
+        "currency",
+        "channel"
+    ]
 
-    # Type checks
-    type_checks = dq_rules.get("type_checks", {}).get("transactions", {})
-    for field, dtype in type_checks.items():
-        if dtype == "decimal":
+    for field in required_fields:
+        if field in df.columns:
             df = df.withColumn(
                 "dq_flag",
-                when(col(field).cast("double").isNull(), "TYPE_MISMATCH")
-                .otherwise(col("dq_flag"))
+                when(
+                    col(field).isNull(),
+                    "NULL_REQUIRED"
+                ).otherwise(col("dq_flag"))
             )
 
-    # Currency normalisation
-    currency_rules = dq_rules.get("currency_normalisation", {})
-    target = currency_rules.get("target_value", "ZAR")
-    accepted = currency_rules.get("accepted_values", [])
-
-    df = df.withColumn(
-        "dq_flag",
-        when(~col("currency").isin(accepted), "CURRENCY_VARIANT")
-        .otherwise(col("dq_flag"))
+    valid_accounts = (
+        accounts_df
+        .select("account_id")
+        .distinct()
+        .withColumn("_account_exists", lit(True))
     )
-
-    df = df.withColumn("currency", upper(trim(col("currency"))))
-    df = df.withColumn("currency", when(col("currency").isin(
-        accepted), target).otherwise(col("currency")))
-
-    # Referential integrity
-    valid_accounts = accounts_df.select("account_id").distinct()
 
     df = df.join(valid_accounts, on="account_id", how="left")
 
     df = df.withColumn(
         "dq_flag",
-        when(col("account_id").isNull(), "ORPHANED_ACCOUNT")
-        .otherwise(col("dq_flag"))
-    )
+        when(
+            col("dq_flag").isNull()
+            & col("account_id").isNotNull()
+            & col("_account_exists").isNull(),
+            "ORPHANED_ACCOUNT"
+        ).otherwise(col("dq_flag"))
+    ).drop("_account_exists")
 
     return df
-
-
 # ==================================================
 # WRITE
 # ==================================================
