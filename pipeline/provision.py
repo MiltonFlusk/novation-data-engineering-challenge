@@ -16,8 +16,8 @@ from pyspark.sql.functions import (
     date_format,
     floor,
     lit,
+    monotonically_increasing_id,
     months_between,
-    row_number,
     to_date,
     to_timestamp,
     upper,
@@ -90,28 +90,6 @@ def load_config():
         return yaml.safe_load(file)
 
 
-def get_data_root():
-    docker_data_root = Path("/data")
-
-    if docker_data_root.exists():
-        return docker_data_root
-
-    return PROJECT_ROOT / "data"
-
-
-def resolve_path(path_value):
-    path_value = str(path_value).replace("\\", "/")
-
-    if path_value.startswith("/data/"):
-        return path_value
-
-    if path_value.startswith("data/"):
-        relative_part = path_value.replace("data/", "", 1)
-        return str(get_data_root() / relative_part)
-
-    return str(PROJECT_ROOT / path_value)
-
-
 def get_config_value(config, sections_and_keys, default=None):
     for section_name, key_name in sections_and_keys:
         section = config.get(section_name, {})
@@ -151,7 +129,7 @@ def create_spark_session(config=None):
 
 
 def read_table(spark, path):
-    """Read Delta when available; fall back to Parquet for current local Silver outputs."""
+    """Read Delta when available; fall back to Parquet for Silver outputs."""
     try:
         return spark.read.format("delta").load(str(path))
     except Exception:
@@ -211,6 +189,7 @@ def standardised_dq_flag(df, alias_name=None):
 
     return when(flag.isin(ALLOWED_DQ_FLAGS), flag).otherwise(lit(None).cast("string"))
 
+
 # ==================================================
 # GOLD TABLES
 # ==================================================
@@ -248,11 +227,11 @@ def build_dim_customers(customers_df):
         )
     )
 
-    window_spec = Window.orderBy("customer_id")
-
+    # monotonically_increasing_id() generates unique IDs in a distributed way
+    # without shuffling all data to a single partition (avoids WindowExec warning)
     return (
         base
-        .withColumn("customer_sk", row_number().over(window_spec).cast("long"))
+        .withColumn("customer_sk", monotonically_increasing_id().cast("long"))
         .select(
             col("customer_sk"),
             col("customer_id").cast("string"),
@@ -279,8 +258,12 @@ def build_dim_accounts(accounts_df, dim_customers):
         .alias("a")
     )
 
-    valid_customers = dim_customers.select(
-        "customer_id").dropDuplicates().alias("c")
+    valid_customers = (
+        dim_customers
+        .select("customer_id")
+        .dropDuplicates()
+        .alias("c")
+    )
 
     joined = accounts_base.join(
         valid_customers,
@@ -288,11 +271,11 @@ def build_dim_accounts(accounts_df, dim_customers):
         "inner",
     )
 
-    window_spec = Window.orderBy(col("a.account_id"))
-
+    # monotonically_increasing_id() replaces Window.orderBy() surrogate key
+    # generation — distributed, no shuffle, no single-partition bottleneck
     return (
         joined
-        .withColumn("account_sk", row_number().over(window_spec).cast("long"))
+        .withColumn("account_sk", monotonically_increasing_id().cast("long"))
         .select(
             col("account_sk"),
             col("a.account_id").cast("string").alias("account_id"),
@@ -391,11 +374,11 @@ def build_fact_transactions(transactions_df, dim_accounts, dim_customers):
             "timestamp").alias("ingestion_timestamp"),
     )
 
-    window_spec = Window.orderBy("transaction_id")
-
+    # monotonically_increasing_id() replaces Window.orderBy() — no global sort,
+    # no single-partition shuffle, fully distributed surrogate key generation
     return (
         base
-        .withColumn("transaction_sk", row_number().over(window_spec).cast("long"))
+        .withColumn("transaction_sk", monotonically_increasing_id().cast("long"))
         .select(
             col("transaction_sk"),
             col("transaction_id"),
