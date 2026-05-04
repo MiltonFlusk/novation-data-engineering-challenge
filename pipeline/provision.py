@@ -10,20 +10,21 @@ from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
-    coalesce,
     concat_ws,
     current_date,
     date_format,
     floor,
+    length,
     lit,
     monotonically_increasing_id,
     months_between,
+    regexp_extract,
     to_date,
     to_timestamp,
+    trim,
     upper,
     when,
 )
-from pyspark.sql.window import Window
 
 # ==================================================
 # CONFIG
@@ -83,20 +84,10 @@ EXCLUDED_ACTIONS = {
 
 
 def load_config():
-    config_path = os.environ.get(
-        "PIPELINE_CONFIG", "config/pipeline_config.yaml")
+    config_path = os.environ.get("PIPELINE_CONFIG", "config/pipeline_config.yaml")
 
     with open(config_path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
-
-
-def get_config_value(config, sections_and_keys, default=None):
-    for section_name, key_name in sections_and_keys:
-        section = config.get(section_name, {})
-        if isinstance(section, dict) and key_name in section:
-            return section[key_name]
-
-    return default
 
 
 # ==================================================
@@ -116,7 +107,9 @@ def create_spark_session(config=None):
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.local.hostname", "localhost")
         .config("spark.driver.memory", "1g")
+        .config("spark.executor.memory", "1g")
         .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.default.parallelism", "2")
         .config("spark.ui.enabled", "false")
     )
 
@@ -169,9 +162,39 @@ def safe_col(df, alias_name, column_name, data_type="string", default_value=None
     return lit(default_value).cast(data_type)
 
 
+def safe_date_expr(column_expr):
+    """
+    Safely parse dates from Stage 1/2 formats:
+    - yyyy-MM-dd
+    - dd/MM/yyyy
+    - MM/dd/yyyy
+    - Unix epoch seconds/milliseconds as strings or numeric-looking values
+
+    Important:
+    Do NOT call to_date() directly on every numeric-looking value.
+    Very large numeric strings can be interpreted as invalid extreme dates and
+    trigger Spark long overflow during date/timestamp conversion.
+    """
+    value = trim(column_expr.cast("string"))
+    digits = regexp_extract(value, r"^([0-9]+)$", 1)
+
+    epoch_seconds = (
+        when((length(digits) == 10), to_timestamp(digits.cast("long")))
+        .when((length(digits) == 13), to_timestamp((digits.cast("long") / lit(1000)).cast("long")))
+        .otherwise(lit(None).cast("timestamp"))
+    )
+
+    return (
+        when(value.rlike(r"^\d{4}-\d{2}-\d{2}$"), to_date(value, "yyyy-MM-dd"))
+        .when(value.rlike(r"^\d{2}/\d{2}/\d{4}$"), to_date(value, "dd/MM/yyyy"))
+        .when(length(digits).isin(10, 13), to_date(epoch_seconds))
+        .otherwise(lit(None).cast("date"))
+    )
+
+
 def safe_date_col(df, alias_name, column_name):
     if column_name in df.columns:
-        return to_date(col(f"{alias_name}.{column_name}"))
+        return safe_date_expr(col(f"{alias_name}.{column_name}"))
 
     return lit(None).cast("date")
 
@@ -202,12 +225,7 @@ def build_dim_customers(customers_df):
         .where(col("customer_id").isNotNull())
     )
 
-    dob_date = coalesce(
-        to_date(col("dob")),
-        to_date(col("dob"), "yyyy-MM-dd"),
-        to_date(col("dob"), "dd/MM/yyyy"),
-        to_date(col("dob"), "MM/dd/yyyy"),
-    )
+    dob_date = safe_date_expr(col("dob"))
 
     age = floor(months_between(current_date(), dob_date) / lit(12))
 
@@ -227,8 +245,6 @@ def build_dim_customers(customers_df):
         )
     )
 
-    # monotonically_increasing_id() generates unique IDs in a distributed way
-    # without shuffling all data to a single partition (avoids WindowExec warning)
     return (
         base
         .withColumn("customer_sk", monotonically_increasing_id().cast("long"))
@@ -271,8 +287,6 @@ def build_dim_accounts(accounts_df, dim_customers):
         "inner",
     )
 
-    # monotonically_increasing_id() replaces Window.orderBy() surrogate key
-    # generation — distributed, no shuffle, no single-partition bottleneck
     return (
         joined
         .withColumn("account_sk", monotonically_increasing_id().cast("long"))
@@ -280,21 +294,14 @@ def build_dim_accounts(accounts_df, dim_customers):
             col("account_sk"),
             col("a.account_id").cast("string").alias("account_id"),
             col("a.customer_id").cast("string").alias("customer_id"),
-            safe_col(accounts_df, "a", "account_type",
-                     "string").alias("account_type"),
-            safe_col(accounts_df, "a", "account_status",
-                     "string").alias("account_status"),
+            safe_col(accounts_df, "a", "account_type", "string").alias("account_type"),
+            safe_col(accounts_df, "a", "account_status", "string").alias("account_status"),
             safe_date_col(accounts_df, "a", "open_date").alias("open_date"),
-            safe_col(accounts_df, "a", "product_tier",
-                     "string").alias("product_tier"),
-            safe_col(accounts_df, "a", "digital_channel",
-                     "string").alias("digital_channel"),
-            safe_col(accounts_df, "a", "credit_limit",
-                     "decimal(18,2)").alias("credit_limit"),
-            safe_col(accounts_df, "a", "current_balance",
-                     "decimal(18,2)").alias("current_balance"),
-            safe_date_col(accounts_df, "a", "last_activity_date").alias(
-                "last_activity_date"),
+            safe_col(accounts_df, "a", "product_tier", "string").alias("product_tier"),
+            safe_col(accounts_df, "a", "digital_channel", "string").alias("digital_channel"),
+            safe_col(accounts_df, "a", "credit_limit", "decimal(18,2)").alias("credit_limit"),
+            safe_col(accounts_df, "a", "current_balance", "decimal(18,2)").alias("current_balance"),
+            safe_date_col(accounts_df, "a", "last_activity_date").alias("last_activity_date"),
         )
     )
 
@@ -325,21 +332,19 @@ def build_fact_transactions(transactions_df, dim_accounts, dim_customers):
         .join(customers_lookup, col("a.customer_id") == col("c.customer_id"), "inner")
     )
 
+    transaction_date = safe_date_expr(col("t.transaction_date"))
+
     if "transaction_time" in transactions_df.columns:
-        transaction_timestamp = coalesce(
-            to_timestamp(
-                concat_ws(
-                    " ",
-                    date_format(to_date(col("t.transaction_date")),
-                                "yyyy-MM-dd"),
-                    col("t.transaction_time"),
-                )
+        transaction_timestamp = to_timestamp(
+            concat_ws(
+                " ",
+                date_format(transaction_date, "yyyy-MM-dd"),
+                col("t.transaction_time").cast("string"),
             ),
-            to_timestamp(to_date(col("t.transaction_date")).cast("string")),
+            "yyyy-MM-dd HH:mm:ss",
         )
     else:
-        transaction_timestamp = to_timestamp(
-            to_date(col("t.transaction_date")).cast("string"))
+        transaction_timestamp = to_timestamp(transaction_date.cast("string"), "yyyy-MM-dd")
 
     if "merchant_subcategory" in transactions_df.columns:
         merchant_subcategory = col("t.merchant_subcategory").cast("string")
@@ -357,25 +362,19 @@ def build_fact_transactions(transactions_df, dim_accounts, dim_customers):
         col("t.transaction_id").cast("string").alias("transaction_id"),
         col("a.account_sk").cast("long").alias("account_sk"),
         col("c.customer_sk").cast("long").alias("customer_sk"),
-        to_date(col("t.transaction_date")).alias("transaction_date"),
+        transaction_date.alias("transaction_date"),
         transaction_timestamp.alias("transaction_timestamp"),
-        upper(col("t.transaction_type").cast(
-            "string")).alias("transaction_type"),
-        safe_col(transactions_df, "t", "merchant_category",
-                 "string").alias("merchant_category"),
+        upper(col("t.transaction_type").cast("string")).alias("transaction_type"),
+        safe_col(transactions_df, "t", "merchant_category", "string").alias("merchant_category"),
         merchant_subcategory.alias("merchant_subcategory"),
-        safe_col(transactions_df, "t", "amount",
-                 "decimal(18,2)").alias("amount"),
+        safe_col(transactions_df, "t", "amount", "decimal(18,2)").alias("amount"),
         lit("ZAR").cast("string").alias("currency"),
         upper(safe_col(transactions_df, "t", "channel", "string")).alias("channel"),
         province.alias("province"),
         standardised_dq_flag(transactions_df, "t").alias("dq_flag"),
-        col("t.ingestion_timestamp").cast(
-            "timestamp").alias("ingestion_timestamp"),
+        col("t.ingestion_timestamp").cast("timestamp").alias("ingestion_timestamp"),
     )
 
-    # monotonically_increasing_id() replaces Window.orderBy() — no global sort,
-    # no single-partition shuffle, fully distributed surrogate key generation
     return (
         base
         .withColumn("transaction_sk", monotonically_increasing_id().cast("long"))
@@ -425,15 +424,11 @@ def safe_count_json(spark, path, fallback_count=0):
 
 
 def get_input_counts(spark, config, accounts_df, customers_df, transactions_df):
-    input_config = config.get("input", {}) if isinstance(
-        config.get("input", {}), dict) else {}
+    input_config = config.get("input", {}) if isinstance(config.get("input", {}), dict) else {}
 
-    accounts_path = input_config.get(
-        "accounts_path", "data/input/accounts.csv")
-    customers_path = input_config.get(
-        "customers_path", "data/input/customers.csv")
-    transactions_path = input_config.get(
-        "transactions_path", "data/input/transactions.jsonl")
+    accounts_path = input_config.get("accounts_path", "data/input/accounts.csv")
+    customers_path = input_config.get("customers_path", "data/input/customers.csv")
+    transactions_path = input_config.get("transactions_path", "data/input/transactions.jsonl")
 
     accounts_count = safe_count_csv(
         spark,
@@ -559,13 +554,11 @@ def run_provisioning():
 
     dim_customers = build_dim_customers(customers)
     dim_accounts = build_dim_accounts(accounts, dim_customers)
-    fact_transactions = build_fact_transactions(
-        transactions, dim_accounts, dim_customers)
+    fact_transactions = build_fact_transactions(transactions, dim_accounts, dim_customers)
 
     write_delta(dim_accounts, f"{gold_base}/dim_accounts", "dim_accounts")
     write_delta(dim_customers, f"{gold_base}/dim_customers", "dim_customers")
-    write_delta(fact_transactions,
-                f"{gold_base}/fact_transactions", "fact_transactions")
+    write_delta(fact_transactions, f"{gold_base}/fact_transactions", "fact_transactions")
 
     source_record_counts = get_input_counts(
         spark,
