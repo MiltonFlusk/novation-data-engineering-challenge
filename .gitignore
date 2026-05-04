@@ -38,4 +38,6 @@ spark-4.1.1-bin-hadoop3/
 spark-4.1.1-bin-hadoop3.tgz
 .venv/
 __pycache__/
-*.pyc
+*.pycdata/input/
+data/output/
+data/stream/
